@@ -1072,15 +1072,13 @@ async function main(): Promise<void> {
     );
   }
 
-  if (
-    state.nextGroupIndex !==
-    batch.startGroupIndex
-  ) {
-    throw new Error(
-      "Batch không khớp posting-state. " +
-      "Dừng để tránh đăng nhầm group."
-    );
-  }
+  /*
+   * posting-state có thể đang nằm giữa batch nếu chương trình
+   * được chạy tiếp sau khi đã đăng một phần batch.
+   *
+   * Không bắt buộc nextGroupIndex phải bằng startGroupIndex.
+   * Thay vào đó, tìm đúng post theo groupIndex thực tế để resume.
+   */
 
   /*
    * 4. Browser
@@ -1157,22 +1155,59 @@ async function main(): Promise<void> {
   /*
    * 6. Xác định bài cần chạy
    */
+  /*
+   * 6. Xác định bài cần chạy
+   *
+   * Resume theo groupIndex thực tế.
+   * Không dùng phép trừ:
+   *   nextGroupIndex - startGroupIndex
+   * vì batch.posts có thể không liên tục.
+   */
   const currentIndex =
-    state.nextGroupIndex -
-    batch.startGroupIndex;
+    batch.posts.findIndex(
+      (post) =>
+        post.groupIndex ===
+        state.nextGroupIndex
+    );
 
-  if (
-    currentIndex < 0 ||
-    currentIndex >=
-      batch.posts.length
-  ) {
+  if (currentIndex < 0) {
+    /*
+     * Nếu state đã vượt quá toàn bộ batch
+     * thì batch này đã xử lý xong.
+     */
+    const remainingPosts =
+      batch.posts.filter(
+        (post) =>
+          post.groupIndex >=
+          state.nextGroupIndex
+      );
+
+    if (remainingPosts.length === 0) {
+      console.log(
+        "\nℹ️ Batch này đã được xử lý hết."
+      );
+
+      console.log(
+        `📌 nextGroupIndex = ${state.nextGroupIndex}`
+      );
+
+      console.log(
+        `📈 Tổng bài đã đăng: ${state.totalPosted}`
+      );
+
+      await context.close();
+      return;
+    }
+
     throw new Error(
-      "Không xác định được bài cần đăng."
+      `Không tìm thấy group ${state.nextGroupIndex} trong daily-batch.json. ` +
+      `Kiểm tra lại batch/state trước khi chạy để tránh đăng nhầm group.`
     );
   }
 
   console.log(
-    `▶️ Bắt đầu từ bài ${currentIndex + 1}`
+    `▶️ Bắt đầu từ group ${state.nextGroupIndex + 1} ` +
+    `(bài ${currentIndex + 1}/${batch.posts.length})`
   );
 
 
