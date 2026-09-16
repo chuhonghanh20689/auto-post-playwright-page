@@ -289,9 +289,76 @@ async function findVisibleText(
    FACEBOOK PAGE COMPOSER
 ============================================================ */
 
+async function getComposerDialog(
+  page: Page
+): Promise<Locator | null> {
+  /*
+   * Facebook có thể có nhiều [role="dialog"] cùng lúc.
+   * Không lấy dialog visible cuối cùng một cách mù quáng vì có thể
+   * đó là popup khác. Ưu tiên dialog thật sự chứa ô nhập bài viết
+   * hoặc tiêu đề Create post.
+   */
+  const dialogs = page.locator('[role="dialog"]');
+  const count = await dialogs.count();
+
+  const composerTexts = [
+    "Create a post",
+    "Tạo bài viết",
+    "What's on your mind?",
+    "Bạn đang nghĩ gì"
+  ];
+
+  for (let i = count - 1; i >= 0; i--) {
+    const dialog = dialogs.nth(i);
+
+    if (!(await dialog.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    const hasTextbox =
+      await dialog
+        .locator(
+          '[contenteditable="true"], [role="textbox"], textarea'
+        )
+        .count()
+        .catch(() => 0);
+
+    if (hasTextbox > 0) {
+      return dialog;
+    }
+
+    const text =
+      await dialog
+        .innerText()
+        .catch(() => "");
+
+    if (
+      composerTexts.some((value) =>
+        text.includes(value)
+      )
+    ) {
+      return dialog;
+    }
+  }
+
+  return null;
+}
+
 async function findComposer(
   page: Page
 ): Promise<Locator | null> {
+  /*
+   * Chỉ tìm composer ở trang Page khi CHƯA có dialog.
+   * Nếu dialog đã mở thì tuyệt đối không click lại composer
+   * phía sau, vì Facebook có thể re-render toàn bộ trang.
+   */
+  const existingDialog =
+    await getComposerDialog(page);
+
+  if (existingDialog) {
+    return existingDialog;
+  }
+
   const exactTexts = [
     "Write something...",
     "Create a post",
@@ -349,6 +416,18 @@ async function findComposer(
 async function openComposer(
   page: Page
 ): Promise<void> {
+  /*
+   * Nếu Facebook đã mở composer rồi thì dùng luôn.
+   * Không click thêm lần nữa.
+   */
+  const existingDialog =
+    await getComposerDialog(page);
+
+  if (existingDialog) {
+    console.log("✅ Composer đã mở sẵn.");
+    return;
+  }
+
   const composer =
     await findComposer(page);
 
@@ -362,31 +441,93 @@ async function openComposer(
     timeout: ACTION_TIMEOUT
   });
 
-  await page.waitForTimeout(1_500);
+  /*
+   * Chờ đúng modal Create post xuất hiện.
+   * Không dựa vào timeout cố định 1.5s.
+   */
+  const deadline =
+    Date.now() + 15_000;
+
+  while (Date.now() < deadline) {
+    const dialog =
+      await getComposerDialog(page);
+
+    if (dialog) {
+      console.log("✅ Create post composer đã mở.");
+      await page.waitForTimeout(700);
+      return;
+    }
+
+    await page.waitForTimeout(300);
+  }
+
+  throw new Error(
+    "Facebook đã click composer nhưng không mở Create post dialog."
+  );
 }
 
 async function findPostTextbox(
   page: Page
 ): Promise<Locator | null> {
+  /*
+   * Ưu tiên textbox nằm trong Create post dialog.
+   */
+  const dialog =
+    await getComposerDialog(page);
+
   const selectors = [
     '[contenteditable="true"][role="textbox"]',
     '[contenteditable="true"]',
     'div[role="textbox"]',
-    "textarea"
+    'textarea',
+    '[aria-label*="What\'s on your mind"]',
+    '[aria-label*="Bạn đang nghĩ gì"]'
   ];
 
-  for (const selector of selectors) {
-    const locator =
-      page
-        .locator(selector)
-        .last();
+  if (dialog) {
+    for (const selector of selectors) {
+      const locators =
+        dialog.locator(selector);
 
-    if (
-      await locator
-        .isVisible()
-        .catch(() => false)
-    ) {
-      return locator;
+      const count =
+        await locators.count().catch(() => 0);
+
+      for (let i = count - 1; i >= 0; i--) {
+        const locator = locators.nth(i);
+
+        if (
+          await locator
+            .isVisible()
+            .catch(() => false)
+        ) {
+          return locator;
+        }
+      }
+    }
+  }
+
+  /*
+   * Fallback quan trọng:
+   * Một số phiên bản Facebook render ô nhập caption bên ngoài
+   * [role="dialog"], dù modal Create post vẫn đang hiển thị.
+   */
+  for (const selector of selectors) {
+    const locators =
+      page.locator(selector);
+
+    const count =
+      await locators.count().catch(() => 0);
+
+    for (let i = count - 1; i >= 0; i--) {
+      const locator = locators.nth(i);
+
+      if (
+        await locator
+          .isVisible()
+          .catch(() => false)
+      ) {
+        return locator;
+      }
     }
   }
 
@@ -401,8 +542,28 @@ async function fillCaption(
     await findPostTextbox(page);
 
   if (!textbox) {
+    /*
+     * Chờ thêm một chút vì Facebook đôi khi render modal trước,
+     * rồi mới mount contenteditable.
+     */
+    const deadline = Date.now() + 8_000;
+
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(500);
+
+      const retryTextbox =
+        await findPostTextbox(page);
+
+      if (retryTextbox) {
+        await retryTextbox.click();
+        await retryTextbox.fill(caption);
+        await page.waitForTimeout(700);
+        return;
+      }
+    }
+
     throw new Error(
-      "Không tìm thấy ô nhập caption."
+      "Không tìm thấy ô nhập caption trong Create post dialog."
     );
   }
 
@@ -419,45 +580,36 @@ async function fillCaption(
 async function dismissComposerSuggestions(
   page: Page
 ): Promise<void> {
-  const titleCandidates = [
-    page
-      .getByText(
-        "Create post",
-        { exact: true }
-      )
-      .last(),
+  /*
+   * KHÔNG click tiêu đề "Create post".
+   *
+   * Facebook có thể re-render composer khi tiêu đề bị click,
+   * khiến trang phía sau giật/reload và Playwright mất target.
+   *
+   * Nếu có suggestion popup thực sự phủ lên composer thì chỉ
+   * dùng Escape; còn bình thường không làm gì.
+   */
+  const dialog =
+    await getComposerDialog(page);
 
-    page
-      .getByText(
-        "Tạo bài viết",
-        { exact: true }
-      )
-      .last()
-  ];
-
-  for (
-    const locator of titleCandidates
-  ) {
-    if (
-      await locator
-        .isVisible()
-        .catch(() => false)
-    ) {
-      await locator
-        .click()
-        .catch(() => {});
-
-      await page.waitForTimeout(600);
-
-      return;
-    }
+  if (!dialog) {
+    return;
   }
 
-  await page.keyboard
-    .press("Escape")
-    .catch(() => {});
+  const bodyText =
+    await dialog
+      .innerText()
+      .catch(() => "");
 
-  await page.waitForTimeout(600);
+  if (
+    /suggest|gợi ý|switch|chọn trang/i.test(bodyText)
+  ) {
+    await page.keyboard
+      .press("Escape")
+      .catch(() => {});
+
+    await page.waitForTimeout(400);
+  }
 }
 
 /* ============================================================
@@ -467,6 +619,13 @@ async function dismissComposerSuggestions(
 async function findPhotoVideoButton(
   page: Page
 ): Promise<Locator | null> {
+  const dialog =
+    await getComposerDialog(page);
+
+  if (!dialog) {
+    return null;
+  }
+
   const selectors = [
     '[aria-label*="Photo/video"]',
     '[aria-label*="Photo / video"]',
@@ -476,7 +635,7 @@ async function findPhotoVideoButton(
 
   for (const selector of selectors) {
     const locator =
-      page
+      dialog
         .locator(selector)
         .last();
 
@@ -489,13 +648,26 @@ async function findPhotoVideoButton(
     }
   }
 
-  return await findVisibleText(
-    page,
-    [
-      /Photo\/video/i,
+  const textLocators = [
+    dialog.getByText(
+      /Photo\/video/i
+    ).last(),
+    dialog.getByText(
       /Ảnh\/video/i
-    ]
-  );
+    ).last()
+  ];
+
+  for (const locator of textLocators) {
+    if (
+      await locator
+        .isVisible()
+        .catch(() => false)
+    ) {
+      return locator;
+    }
+  }
+
+  return null;
 }
 
 async function uploadImages(
@@ -622,22 +794,34 @@ async function uploadImages(
 async function findPostButton(
   page: Page
 ): Promise<Locator | null> {
+  const dialog =
+    await getComposerDialog(page);
+
+  if (!dialog) {
+    return null;
+  }
+
   const selectors = [
     '[aria-label="Post"]',
     '[aria-label="Đăng"]',
     'div[role="button"]:has-text("Post")',
-    'div[role="button"]:has-text("Đăng")'
+    'div[role="button"]:has-text("Đăng")',
+    'button:has-text("Post")',
+    'button:has-text("Đăng")'
   ];
 
   for (const selector of selectors) {
     const locator =
-      page
+      dialog
         .locator(selector)
         .last();
 
     if (
       await locator
         .isVisible()
+        .catch(() => false) &&
+      await locator
+        .isEnabled()
         .catch(() => false)
     ) {
       return locator;
@@ -660,6 +844,13 @@ class PostClickUncertainError extends Error {
 async function findNextButton(
   page: Page
 ): Promise<Locator | null> {
+  const dialog =
+    await getComposerDialog(page);
+
+  if (!dialog) {
+    return null;
+  }
+
   const selectors = [
     '[aria-label="Next"]',
     '[aria-label="Tiếp"]',
@@ -671,20 +862,24 @@ async function findNextButton(
   ];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector).last();
+    const locator =
+      dialog
+        .locator(selector)
+        .last();
+
     if (
-      await locator.isVisible().catch(() => false) &&
-      await locator.isEnabled().catch(() => true)
+      await locator
+        .isVisible()
+        .catch(() => false) &&
+      await locator
+        .isEnabled()
+        .catch(() => false)
     ) {
       return locator;
     }
   }
 
-  return await findVisibleText(page, [
-    /^Next$/i,
-    /^Tiếp$/i,
-    /^Tiếp theo$/i
-  ]);
+  return null;
 }
 
 async function clickNextAfterUpload(
@@ -742,16 +937,26 @@ async function publishPost(
     throw new PostClickUncertainError(reason);
   }
 
+  /*
+   * Sau khi click Post, chỉ xác nhận composer đã đóng bằng
+   * getComposerDialog(). Không dùng findComposer() ở đây vì
+   * findComposer() trả về chính dialog khi nó vẫn đang mở.
+   */
   const closeDeadline = Date.now() + 30_000;
 
   while (Date.now() < closeDeadline) {
-    const composer = await findComposer(page);
-    if (!composer) return;
+    const composerDialog = await getComposerDialog(page);
+
+    if (!composerDialog) {
+      console.log("✅ Composer đã đóng sau khi click Post.");
+      return;
+    }
+
     await page.waitForTimeout(750);
   }
 
   throw new PostClickUncertainError(
-    "Đã click Post nhưng không xác nhận được composer đã đóng."
+    "Đã click Post nhưng sau 30 giây vẫn chưa xác nhận được composer đã đóng."
   );
 }
 
@@ -806,6 +1011,38 @@ async function postOne(
   await page.waitForTimeout(
     2_500
   );
+
+  /*
+   * Xác nhận đang đứng đúng Facebook Page trước khi mở composer.
+   * Nếu Facebook vẫn đang chuyển trang/re-render thì chờ thêm.
+   */
+  const targetPageId =
+    "61565902337879";
+
+  const pageDeadline =
+    Date.now() + 15_000;
+
+  while (Date.now() < pageDeadline) {
+    if (
+      page.url().includes(
+        `id=${targetPageId}`
+      )
+    ) {
+      break;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  if (
+    !page.url().includes(
+      `id=${targetPageId}`
+    )
+  ) {
+    throw new Error(
+      "Facebook chưa ổn định ở đúng Page Đảo Bánh Quy."
+    );
+  }
 
   /*
    * Mở composer.
@@ -1007,6 +1244,37 @@ async function main(): Promise<void> {
       page
     );
 
+    /*
+     * Chờ Facebook ổn định đúng Page trước khi bắt đầu thao tác.
+     */
+    const targetPageId =
+      "61565902337879";
+
+    const pageDeadline =
+      Date.now() + 15_000;
+
+    while (Date.now() < pageDeadline) {
+      if (
+        page.url().includes(
+          `id=${targetPageId}`
+        )
+      ) {
+        break;
+      }
+
+      await page.waitForTimeout(500);
+    }
+
+    if (
+      !page.url().includes(
+        `id=${targetPageId}`
+      )
+    ) {
+      throw new Error(
+        "Facebook chưa ổn định ở đúng Page Đảo Bánh Quy."
+      );
+    }
+
     const loginDetected =
       await page
         .locator(
@@ -1050,7 +1318,7 @@ const captionIndex =
       `\n✍️ Caption ${captionIndex + 1}/${captions.length}`
     );
     console.log(
-      "🖼️ Facebook Page: chọn đúng 4 ảnh cho bài này."
+      `🖼️ Facebook Page: chuẩn bị ${imagesPerPost} ảnh cho bài này.`
     );
 
     await postOne(

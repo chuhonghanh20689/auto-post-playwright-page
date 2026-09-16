@@ -3,6 +3,7 @@ import path from 'path';
 
 const PROFILE_DIR = path.resolve('./fbpost/.browser-profile');
 const PAGE_NAME = 'Đảo Bánh Quy';
+const PAGE_ID = '61568152018103';
 
 async function openProfileMenu(page: Page): Promise<boolean> {
   console.log('\n========================================');
@@ -81,90 +82,179 @@ async function openSelectProfile(page: Page): Promise<boolean> {
 async function switchToPage(page: Page): Promise<boolean> {
   console.log('\n========================================');
   console.log(`🔵 CHỌN PAGE: ${PAGE_NAME}`);
+  console.log(`🆔 PAGE ID: ${PAGE_ID}`);
   console.log('========================================');
 
   /*
-   * Trên Facebook của bạn hiện tại:
+   * QUAN TRỌNG:
+   * Trong screenshot của Facebook có 2 dòng cùng tên "Đảo Bánh Quy":
    *
-   * nth(0) = Đảo Bánh Quy cá nhân
-   * nth(1) = Đảo Bánh Quy Page
+   * 1. Dòng trên: Đảo Bánh Quy + dấu ✓
+   *    -> profile cá nhân hiện tại.
    *
-   * Vì hai cái cùng tên nên phải chọn nth(1).
+   * 2. Dòng dưới: Đảo Bánh Quy + "3 notifications"
+   *    -> ĐẢO BÁNH QUY PAGE cần chọn.
+   *
+   * Vì vậy tuyệt đối không dùng:
+   *   getByText(PAGE_NAME).first()
+   *   nth(1)
+   *   hoặc click text tên Page một cách mù quáng.
+   *
+   * Flow:
+   * Account menu -> See all profiles -> Select profile
+   * -> tìm option có PAGE_NAME + notifications
+   * -> click option đó.
    */
 
-  const pageNames = page.getByText(PAGE_NAME, {
+  const pageNameLocators = page.getByText(PAGE_NAME, {
     exact: true,
   });
 
-  const count = await pageNames.count();
+  const count = await pageNameLocators.count();
+  console.log(`🔎 Có ${count} element "${PAGE_NAME}" trong Select profile.`);
 
-  console.log(
-    `🔎 Tìm thấy ${count} phần tử tên "${PAGE_NAME}".`
-  );
+  if (count === 0) {
+    console.log('❌ Không tìm thấy Đảo Bánh Quy trong Select profile.');
+    return false;
+  }
 
-  if (count < 2) {
+  // ------------------------------------------------------------
+  // 1. Ưu tiên tìm option có "notifications".
+  //    Đây chính là dấu hiệu nhìn thấy trong screenshot:
+  //    "Đảo Bánh Quy" + "3 notifications".
+  // ------------------------------------------------------------
+  for (let i = 0; i < count; i++) {
+    const name = pageNameLocators.nth(i);
+
+    try {
+      if (!(await name.isVisible())) continue;
+
+      const option = name.locator(
+        'xpath=ancestor::*[' +
+          'contains(translate(normalize-space(.), ' +
+          '"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "notifications")' +
+        '][1]'
+      );
+
+      if (await option.count() === 0) continue;
+
+      const optionText = (
+        await option.first().innerText().catch(() => '')
+      ).trim();
+
+      if (!/notifications/i.test(optionText)) continue;
+
+      console.log(
+        `🎯 Tìm thấy Page candidate nth(${i}) có notifications:`
+      );
+      console.log(`   "${optionText.substring(0, 300)}"`);
+
+      // Lấy clickable ancestor gần nhất của option.
+      const clickable = option.first().locator(
+        'xpath=ancestor-or-self::*[@role="button" or @role="link" or self::a][1]'
+      );
+
+      const target =
+        (await clickable.count()) > 0
+          ? clickable.first()
+          : option.first();
+
+      await target.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(500);
+
+      console.log('👉 Click Đảo Bánh Quy PAGE...');
+      await target.click({ timeout: 5000 });
+
+      console.log('✅ Đã click đúng option Page.');
+      console.log('⏳ Chờ Facebook switch identity...');
+      await page.waitForTimeout(7000);
+
+      return true;
+    } catch (error) {
+      console.log(`⚠️ Candidate nth(${i}) không xử lý được.`);
+    }
+  }
+
+  // ------------------------------------------------------------
+  // 2. Fallback: tìm PAGE_ID trong DOM.
+  // ------------------------------------------------------------
+  const idSelectors = [
+    `[href*="${PAGE_ID}"]`,
+    `[aria-label*="${PAGE_ID}"]`,
+    `[data-page-id="${PAGE_ID}"]`,
+    `[data-profileid="${PAGE_ID}"]`,
+  ];
+
+  for (const selector of idSelectors) {
+    const candidates = page.locator(selector);
+    const idCount = await candidates.count();
+
+    if (idCount === 0) continue;
+
     console.log(
-      '❌ Không tìm thấy đủ 2 phần tử để xác định Page.'
+      `🎯 Tìm thấy ${idCount} element chứa PAGE_ID bằng ${selector}`
     );
 
-    const bodyText = await page.locator('body').innerText();
+    for (let i = 0; i < idCount; i++) {
+      try {
+        const candidate = candidates.nth(i);
+        if (!(await candidate.isVisible())) continue;
 
-    console.log('\n========== FACEBOOK TEXT ==========');
-    console.log(bodyText.substring(0, 5000));
-    console.log('===================================\n');
+        const clickable = candidate.locator(
+          'xpath=ancestor-or-self::*[@role="button" or @role="link" or self::a][1]'
+        );
 
-    return false;
+        const target =
+          (await clickable.count()) > 0
+            ? clickable.first()
+            : candidate;
+
+        const targetText = (
+          await target.innerText().catch(() => '')
+        ).trim();
+
+        if (
+          !targetText.includes(PAGE_NAME) &&
+          !targetText.toLowerCase().includes('notifications')
+        ) {
+          continue;
+        }
+
+        await target.scrollIntoViewIfNeeded();
+        await page.waitForTimeout(500);
+
+        console.log('👉 Click Page theo PAGE_ID...');
+        await target.click({ timeout: 5000 });
+
+        console.log('✅ Đã click Page.');
+        console.log('⏳ Chờ Facebook switch identity...');
+        await page.waitForTimeout(7000);
+
+        return true;
+      } catch {
+        // thử candidate tiếp theo
+      }
+    }
   }
 
-  const pageOption = pageNames.nth(1);
-
-  console.log('✅ Đã xác định Page là phần tử thứ 2.');
-
-  await pageOption.scrollIntoViewIfNeeded();
-
-  await page.waitForTimeout(500);
-
-  const box = await pageOption.boundingBox();
-
-  if (!box) {
-    console.log('❌ Không lấy được vị trí của Page.');
-
-    return false;
-  }
-
+  // ------------------------------------------------------------
+  // 3. Không tìm thấy Page -> KHÔNG click đại.
+  //    In toàn bộ text để lần sau có dữ liệu debug.
+  // ------------------------------------------------------------
   console.log(
-    `📍 Page position: ` +
-    `x=${Math.round(box.x)}, ` +
-    `y=${Math.round(box.y)}, ` +
-    `w=${Math.round(box.width)}, ` +
-    `h=${Math.round(box.height)}`
+    '\n❌ KHÔNG XÁC ĐỊNH ĐƯỢC PAGE ĐẢO BÁNH QUY AN TOÀN.'
+  );
+  console.log(
+    '❌ Script sẽ KHÔNG click vào dòng đầu tiên để tránh switch nhầm account.'
   );
 
-  /*
-   * Không dùng locator.click().
-   *
-   * Facebook profile switcher là component động,
-   * nên click bằng mouse vào chính vị trí text
-   * ổn định hơn.
-   */
+  const bodyText = await page.locator('body').innerText().catch(() => '');
 
-  const clickX = box.x + box.width / 2;
-  const clickY = box.y + box.height / 2;
+  console.log('\n========== SELECT PROFILE TEXT ==========');
+  console.log(bodyText.substring(0, 5000));
+  console.log('=========================================\n');
 
-  console.log(
-    `👉 Đang click tại x=${Math.round(clickX)}, ` +
-    `y=${Math.round(clickY)}...`
-  );
-
-  await page.mouse.click(clickX, clickY);
-
-  console.log('✅ Đã gửi click.');
-
-  console.log('⏳ Chờ Facebook chuyển sang Page...');
-
-  await page.waitForTimeout(5000);
-
-  return true;
+  return false;
 }
 
 async function verifyPage(page: Page): Promise<boolean> {

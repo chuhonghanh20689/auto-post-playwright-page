@@ -1154,21 +1154,68 @@ async function main(): Promise<void> {
 
   /*
    * 6. Xác định bài cần chạy
-   */
-  /*
-   * 6. Xác định bài cần chạy
    *
    * Resume theo groupIndex thực tế.
+   *
+   * QUAN TRỌNG:
+   * daily-batch.json là một batch mới có thể bắt đầu ở group
+   * cao hơn state.nextGroupIndex. Ví dụ:
+   *
+   *   state.nextGroupIndex = 129
+   *   batch.startGroupIndex = 130
+   *
+   * Trường hợp này KHÔNG phải lỗi. Có nghĩa batch mới đã được
+   * prepare sang group 130 trong khi state vẫn còn ở 129.
+   *
+   * Vì vậy:
+   * - Nếu state nằm trước batch hiện tại => bắt đầu từ post đầu tiên
+   *   của batch.
+   * - Nếu state nằm trong batch => resume từ post đầu tiên có
+   *   groupIndex >= state.nextGroupIndex.
+   * - Nếu state đã vượt qua toàn bộ batch => batch đã xong.
+   *
    * Không dùng phép trừ:
    *   nextGroupIndex - startGroupIndex
    * vì batch.posts có thể không liên tục.
    */
-  const currentIndex =
-    batch.posts.findIndex(
-      (post) =>
-        post.groupIndex ===
-        state.nextGroupIndex
+
+  let currentIndex = batch.posts.findIndex(
+    (post) =>
+      post.groupIndex >= state.nextGroupIndex
+  );
+
+  /*
+   * Batch mới bắt đầu sau state hiện tại.
+   * Ví dụ state = 129, batch bắt đầu = 130.
+   * Đây là trường hợp bình thường khi prepare batch mới.
+   */
+  if (
+    state.nextGroupIndex <
+    batch.startGroupIndex
+  ) {
+    currentIndex = 0;
+
+    console.log(
+      `\nℹ️ State đang ở group ${state.nextGroupIndex + 1}, ` +
+      `nhưng batch mới bắt đầu từ group ${batch.startGroupIndex + 1}.`
     );
+
+    console.log(
+      `▶️ Tự động chuyển sang batch mới từ group ${batch.startGroupIndex + 1}.`
+    );
+
+    /*
+     * Đồng bộ state về group thực tế đầu tiên của batch.
+     * Không tăng totalPosted vì chưa đăng bài nào ở đây.
+     */
+    state.nextGroupIndex =
+      batch.posts[0].groupIndex;
+
+    writeJson(
+      STATE_FILE,
+      state
+    );
+  }
 
   if (currentIndex < 0) {
     /*
@@ -1200,10 +1247,26 @@ async function main(): Promise<void> {
     }
 
     throw new Error(
-      `Không tìm thấy group ${state.nextGroupIndex} trong daily-batch.json. ` +
-      `Kiểm tra lại batch/state trước khi chạy để tránh đăng nhầm group.`
+      `Không tìm thấy post phù hợp với nextGroupIndex ${state.nextGroupIndex} ` +
+      `trong daily-batch.json. Kiểm tra lại batch/state trước khi chạy ` +
+      `để tránh đăng nhầm group.`
     );
   }
+
+  /*
+   * Sau khi tự đồng bộ batch mới, state.nextGroupIndex chính là
+   * groupIndex thực tế của bài sẽ chạy.
+   */
+  const currentPost =
+    batch.posts[currentIndex];
+
+  state.nextGroupIndex =
+    currentPost.groupIndex;
+
+  writeJson(
+    STATE_FILE,
+    state
+  );
 
   console.log(
     `▶️ Bắt đầu từ group ${state.nextGroupIndex + 1} ` +
