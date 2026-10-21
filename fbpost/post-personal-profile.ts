@@ -2,7 +2,7 @@ import { chromium, BrowserContext, Locator, Page } from "@playwright/test";
 import fs from "fs";
 import path from "path";
 
-const FILE_VERSION = "PAGE_POST_V3_NO_STORY_2026-08-23";
+const FILE_VERSION = "PAGE_POST_V3_POPUP_GUARD_2026-10-21";
 
 type Caption = {
   keyword: string;
@@ -580,34 +580,93 @@ async function fillCaption(
 async function dismissComposerSuggestions(
   page: Page
 ): Promise<void> {
-  /*
-   * KHÔNG click tiêu đề "Create post".
-   *
-   * Facebook có thể re-render composer khi tiêu đề bị click,
-   * khiến trang phía sau giật/reload và Playwright mất target.
-   *
-   * Nếu có suggestion popup thực sự phủ lên composer thì chỉ
-   * dùng Escape; còn bình thường không làm gì.
-   */
-  const dialog =
-    await getComposerDialog(page);
+  // Facebook rotates the wording of these optional CTA dialogs, e.g.
+  // "Speak With People Directly" / "Call Now" and
+  // "Chat directly with customers" / "Send Message".
+  // Identify the popup by its optional-action buttons, not its title alone.
+  const deadline = Date.now() + 7_000;
 
-  if (!dialog) {
-    return;
+  while (Date.now() < deadline) {
+    const dialogs = page.locator('[role="dialog"]');
+    const count = await dialogs.count().catch(() => 0);
+    let dismissedOne = false;
+
+    for (let i = count - 1; i >= 0; i--) {
+      const popup = dialogs.nth(i);
+      if (!(await popup.isVisible().catch(() => false))) continue;
+
+      const text = (await popup.innerText().catch(() => "")).toLowerCase();
+      const hasNotNow = /not now|bây giờ không|để sau|không phải bây giờ/i.test(text);
+      const hasSuggestionAction =
+        /add button|send message|call now|speak with people directly|chat directly with customers/i.test(text);
+
+      // Only dismiss the known Facebook CTA suggestion, not the post composer.
+      if (!hasNotNow || !hasSuggestionAction) continue;
+
+      console.log("ℹ️ Facebook CTA suggestion popup detected; dismissing it...");
+
+      const notNowCandidates = [
+        popup.getByText("Not now", { exact: true }).last(),
+        popup.getByText("Bây giờ không", { exact: true }).last(),
+        popup.getByText("Để sau", { exact: true }).last()
+      ];
+
+      let dismissed = false;
+      for (const candidate of notNowCandidates) {
+        if (await candidate.isVisible().catch(() => false)) {
+          try {
+            await candidate.click({ timeout: 3_000 });
+            dismissed = true;
+            break;
+          } catch {
+            // Try the close button below if this label is not clickable.
+          }
+        }
+      }
+
+      if (!dismissed) {
+        const closeSelectors = [
+          'button[aria-label="Close"]',
+          '[role="button"][aria-label="Close"]',
+          'button[aria-label="Close dialog"]',
+          '[aria-label="Close"]',
+          'button[title="Close"]',
+          '[aria-label*="Đóng"]'
+        ];
+
+        for (const selector of closeSelectors) {
+          const close = popup.locator(selector).last();
+          if (await close.isVisible().catch(() => false)) {
+            try {
+              await close.click({ timeout: 3_000 });
+              dismissed = true;
+              break;
+            } catch {
+              // Continue to the next close selector.
+            }
+          }
+        }
+      }
+
+      if (!dismissed) {
+        await page.keyboard.press("Escape").catch(() => {});
+      }
+
+      await page.waitForTimeout(700);
+      dismissedOne = true;
+      break;
+    }
+
+    if (!dismissedOne) break;
   }
 
-  const bodyText =
-    await dialog
-      .innerText()
-      .catch(() => "");
+  // Preserve the original handling for unrelated composer suggestions.
+  const dialog = await getComposerDialog(page);
+  if (!dialog) return;
 
-  if (
-    /suggest|gợi ý|switch|chọn trang/i.test(bodyText)
-  ) {
-    await page.keyboard
-      .press("Escape")
-      .catch(() => {});
-
+  const bodyText = await dialog.innerText().catch(() => "");
+  if (/suggest|gợi ý|switch|chọn trang/i.test(bodyText)) {
+    await page.keyboard.press("Escape").catch(() => {});
     await page.waitForTimeout(400);
   }
 }
@@ -619,51 +678,58 @@ async function dismissComposerSuggestions(
 async function findPhotoVideoButton(
   page: Page
 ): Promise<Locator | null> {
-  const dialog =
-    await getComposerDialog(page);
+  const dialog = await getComposerDialog(page);
 
-  if (!dialog) {
-    return null;
-  }
+  // Một số phiên bản Facebook render nút chọn ảnh bên ngoài
+  // [role="dialog"], dù cửa sổ Create post vẫn đang mở.
+  const scopes: Locator[] = dialog ? [dialog, page.locator("body")] : [page.locator("body")];
 
   const selectors = [
-    '[aria-label*="Photo/video"]',
-    '[aria-label*="Photo / video"]',
-    '[aria-label*="Ảnh/video"]',
-    '[aria-label*="Ảnh / video"]'
+    '[aria-label*="Photo/video" i]',
+    '[aria-label*="Photo / video" i]',
+    '[aria-label*="Add photos/videos" i]',
+    '[aria-label*="Add photo/video" i]',
+    '[aria-label*="Ảnh/video" i]',
+    '[aria-label*="Ảnh / video" i]',
+    '[role="button"]:has-text("Photo/video")',
+    '[role="button"]:has-text("Photo / video")',
+    '[role="button"]:has-text("Add photos/videos")',
+    '[role="button"]:has-text("Ảnh/video")',
+    '[role="button"]:has-text("Ảnh / video")'
   ];
 
-  for (const selector of selectors) {
-    const locator =
-      dialog
-        .locator(selector)
-        .last();
+  for (const scope of scopes) {
+    for (const selector of selectors) {
+      const locators = scope.locator(selector);
+      const count = await locators.count().catch(() => 0);
 
-    if (
-      await locator
-        .isVisible()
-        .catch(() => false)
-    ) {
-      return locator;
+      for (let i = count - 1; i >= 0; i--) {
+        const locator = locators.nth(i);
+        if (
+          await locator.isVisible().catch(() => false) &&
+          await locator.isEnabled().catch(() => true)
+        ) {
+          return locator;
+        }
+      }
     }
-  }
 
-  const textLocators = [
-    dialog.getByText(
-      /Photo\/video/i
-    ).last(),
-    dialog.getByText(
-      /Ảnh\/video/i
-    ).last()
-  ];
+    // Fallback theo nhãn hiển thị, bao gồm một số biến thể ngôn ngữ.
+    const textLocators = [
+      scope.getByText(/Photo\s*\/\s*video/i),
+      scope.getByText(/Add photos?\s*\/\s*videos?/i),
+      scope.getByText(/Ảnh\s*\/\s*video/i),
+      scope.getByText(/Thêm ảnh/i)
+    ];
 
-  for (const locator of textLocators) {
-    if (
-      await locator
-        .isVisible()
-        .catch(() => false)
-    ) {
-      return locator;
+    for (const matches of textLocators) {
+      const count = await matches.count().catch(() => 0);
+      for (let i = count - 1; i >= 0; i--) {
+        const locator = matches.nth(i);
+        if (await locator.isVisible().catch(() => false)) {
+          return locator;
+        }
+      }
     }
   }
 
@@ -697,6 +763,9 @@ async function uploadImages(
   console.log(
     `🖼️ Upload ${imagePaths.length} ảnh...`
   );
+
+  // Dismiss Facebook's "Speak With People Directly" popup if it appears late.
+  await dismissComposerSuggestions(page);
 
   const button =
     await findPhotoVideoButton(
